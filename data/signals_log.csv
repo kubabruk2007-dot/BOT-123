@@ -1,0 +1,2 @@
+ts,symbol,timeframe,price,ema_fast_period,ema_slow_period,rsi_period,rsi_min,rsi_max,ema_fast,ema_slow,rsi,buy_signal
+2026-02-23 11:30:00,ETH/USDC,15m,1912.48,20,50,14,45.0,65.0,1901.6505571216917,1900.8598399646364,62.29081132436734,False
