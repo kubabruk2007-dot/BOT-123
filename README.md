@@ -7,11 +7,12 @@ Current scope: Stage 1 (read-only), no real orders.
 - fetches candles from Binance Spot (via ccxt)
 - computes EMA and RSI indicators
 - evaluates BUY/NO BUY signal
-- appends result to `data/signals_log.csv`
+- appends result to `data/signals_log.csv` and `data/signals_log.jsonl`
 
 ## Project structure
 - `src/bot_readonly.py` main script (read-only)
-- `data/signals_log.csv` history of signal snapshots
+- `data/signals_log.csv` history of signal snapshots (compact)
+- `data/signals_log.jsonl` history with per-field descriptions (readable)
 - `.env` local strategy config
 - `.env.example` template config
 - `run.ps1` one-command runner
@@ -24,6 +25,8 @@ Current scope: Stage 1 (read-only), no real orders.
 
 ## Configuration (.env)
 ```env
+EXCHANGE=binance
+BINANCE_API_BASES=https://api.binance.com,https://api1.binance.com,https://api2.binance.com,https://api3.binance.com
 SYMBOL=ETH/USDC
 TIMEFRAME=15m
 CANDLE_LIMIT=200
