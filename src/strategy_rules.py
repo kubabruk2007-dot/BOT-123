@@ -1,95 +1,197 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Any
+
+import pandas as pd
+
+
+REGIME_BULL = "trend_bull"
+REGIME_BEAR = "trend_bear"
+REGIME_FLAT = "trend_flat"
+VALID_TIE_POLICIES = {"SL_FIRST", "TP_FIRST"}
 
 
 @dataclass(frozen=True)
 class StrategyConfig:
-    ema_fast_period: int = 20  # Okres szybkiej EMA (reakcja na krotkie ruchy ceny).
-    ema_slow_period: int = 50  # Okres wolnej EMA (kierunek srednioterminowy).
-    ema_trend_period: int = 200  # Okres EMA trendowej (filtr trendu glownego).
-    rsi_period: int = 14  # Okres RSI.
-    rsi_min: float = 40.0  # Dolny prog RSI dla wejscia BUY.
-    rsi_max: float = 55.0  # Gorny prog RSI dla wejscia BUY.
-    rsi_sell_high: float = 70.0  # RSI powyzej tej wartosci moze wywolywac SELL.
-    rsi_sell_low: float = 35.0  # RSI ponizej tej wartosci moze wywolywac SELL.
-    enable_rsi_sell: bool = True  # Czy RSI ma brac udzial w warunku SELL.
-    force_buy: bool = False  # Wymusza BUY niezaleznie od pozostalych warunkow.
-    disable_trend_filter: bool = False  # Wylacza filtr trendu (ema_slow > ema_trend).
-    disable_pullback_filter: bool = False  # Wylacza filtr pullbacku (ema_fast < ema_slow).
-    rsi_only_sell: bool = False  # Gdy True, SELL tylko po ekstremach RSI (na nowym sygnale).
-    tp_pct: float = 1.2  # Take profit w procentach od ceny wejscia.
-    sl_pct: float = 0.7  # Stop loss w procentach od ceny wejscia.
+    htf_flat_band_pct: float = 0.001
+    comp_ratio: float = 0.9
+    chop_comp_ratio_multiplier: float = 0.95
+    sl_mult: float = 1.5
+    tp_mult: float = 2.4
+    breakeven_after_r: float = 1.0
+    tie_policy: str = "SL_FIRST"
+    regime_switch_confirm: int = 3
+    regime_min_hold: int = 6
+    adx_period: int = 14
+    use_adx_filter: bool = False
+    adx_min: float = 18.0
 
 
 DEFAULT_STRATEGY = StrategyConfig()
 
 
-def should_buy_signal(
-    ema_fast_value: float,
-    ema_slow_value: float,
-    ema_trend_value: float,
-    rsi_now: float,
-    rsi_prev: float,
-    config: StrategyConfig,
-) -> bool:
-    # ema_* i rsi_* to wartosci policzone dla swiecy sygnalowej (zamknietej).
-    # Zwraca True, gdy warunki BUY sa spelnione.
-    trend_ok = (ema_slow_value > ema_trend_value) or config.disable_trend_filter
-    pullback_ok = (ema_fast_value < ema_slow_value) or config.disable_pullback_filter
+def detect_regime_from_htf(
+    ema50_htf: float | None,
+    ema200_htf: float | None,
+    flat_band_pct: float,
+) -> str:
+    if ema50_htf is None or ema200_htf is None or ema200_htf == 0:
+        return REGIME_FLAT
 
-    signal = (
-        trend_ok
-        and pullback_ok
-        and (rsi_now > rsi_prev)
-        and (config.rsi_min <= rsi_now <= config.rsi_max)
-    )
-    return True if config.force_buy else signal
+    spread = (ema50_htf - ema200_htf) / abs(ema200_htf)
+    if spread > flat_band_pct:
+        return REGIME_BULL
+    if spread < -flat_band_pct:
+        return REGIME_BEAR
+    return REGIME_FLAT
+
+
+def update_regime_hysteresis(
+    raw_regime: str,
+    regime_state: dict[str, Any] | None,
+    switch_confirm: int,
+    min_hold: int,
+) -> dict[str, Any]:
+    state = dict(regime_state or {})
+    active = str(state.get("active") or raw_regime)
+    candidate = str(state.get("candidate") or active)
+    candidate_count = int(state.get("candidate_count") or 0)
+    hold_count = int(state.get("hold_count") or 0)
+
+    if raw_regime == active:
+        hold_count += 1
+        candidate = active
+        candidate_count = 0
+    elif hold_count < min_hold:
+        hold_count += 1
+    else:
+        hold_count += 1
+        if raw_regime == candidate:
+            candidate_count += 1
+        else:
+            candidate = raw_regime
+            candidate_count = 1
+        if candidate_count >= switch_confirm:
+            active = candidate
+            hold_count = 0
+            candidate = active
+            candidate_count = 0
+
+    return {
+        "active": active,
+        "candidate": candidate,
+        "candidate_count": candidate_count,
+        "hold_count": hold_count,
+    }
+
+
+def should_buy_signal(
+    signal_row: pd.Series,
+    active_regime: str,
+    config: StrategyConfig,
+) -> tuple[bool, str]:
+    if active_regime == REGIME_BEAR:
+        return False, "regime_bear_no_trade"
+
+    htf_regime = str(signal_row.get("raw_regime", REGIME_FLAT))
+    if htf_regime != REGIME_BULL:
+        return False, "htf_not_bull"
+
+    atr_now = signal_row.get("atr14")
+    atr_sma = signal_row.get("atr_sma50")
+    hh20_prev = signal_row.get("hh20_prev")
+    close_price = signal_row.get("close")
+    adx_val = signal_row.get("adx14")
+
+    needed = [atr_now, atr_sma, hh20_prev, close_price]
+    if any(pd.isna(v) for v in needed):
+        return False, "warmup"
+
+    ratio = config.comp_ratio
+    if active_regime == REGIME_FLAT:
+        ratio *= config.chop_comp_ratio_multiplier
+
+    compression_ok = float(atr_now) < float(ratio) * float(atr_sma)
+    if not compression_ok:
+        return False, "no_compression"
+
+    if config.use_adx_filter:
+        if pd.isna(adx_val) or float(adx_val) < config.adx_min:
+            return False, "adx_too_low"
+
+    breakout_ok = float(close_price) > float(hh20_prev)
+    if not breakout_ok:
+        return False, "no_breakout"
+
+    return True, "entry_breakout"
+
+
+def build_position_after_entry(
+    entry_price: float,
+    entry_ts: str,
+    entry_qty: float,
+    atr_entry: float,
+    config: StrategyConfig,
+) -> dict[str, Any]:
+    sl_price = entry_price - (config.sl_mult * atr_entry)
+    tp_price = entry_price + (config.tp_mult * atr_entry)
+    risk_r = max(0.0, entry_price - sl_price)
+    return {
+        "is_open": True,
+        "entry_price": entry_price,
+        "entry_ts": entry_ts,
+        "entry_qty": entry_qty,
+        "atr_entry": atr_entry,
+        "sl_price": sl_price,
+        "tp_price": tp_price,
+        "risk_r": risk_r,
+        "breakeven_done": False,
+        "pending_sell": False,
+        "pending_reason": None,
+    }
 
 
 def should_sell_signal(
     position: dict[str, Any],
     live_high: float,
     live_low: float,
-    price: float,
-    ema_slow_value: float,
-    ema_trend_value: float,
-    rsi_now: float,
-    is_new_signal: bool,
     config: StrategyConfig,
-) -> tuple[bool, str | None, float | None]:
-    # position: stan otwartej pozycji (entry_price, pending_sell, pending_reason).
-    # live_high/live_low: biezace high/low aktualnie formowanej swiecy.
-    # price: cena swiecy sygnalowej (lub fallback do wykonania).
-    # Zwraca: (czy_sprzedac, powod_sprzedazy, cena_docelowa_sprzedazy).
-    entry_price = float(position.get("entry_price") or 0)
-    pending_sell = bool(position.get("pending_sell"))
-    pending_reason = position.get("pending_reason")
+) -> tuple[bool, str | None, float | None, dict[str, Any]]:
+    if not position or not bool(position.get("is_open")):
+        return False, None, None, position
 
-    if entry_price <= 0:
-        return False, None, None
+    tie_policy = str(config.tie_policy).upper()
+    if tie_policy not in VALID_TIE_POLICIES:
+        tie_policy = "SL_FIRST"
 
-    tp_price = entry_price * (1 + config.tp_pct / 100)
-    sl_price = entry_price * (1 - config.sl_pct / 100)
+    updated = dict(position)
+    entry_price = float(updated.get("entry_price") or 0.0)
+    sl_price = float(updated.get("sl_price") or 0.0)
+    tp_price = float(updated.get("tp_price") or 0.0)
+    risk_r = float(updated.get("risk_r") or max(0.0, entry_price - sl_price))
+    breakeven_done = bool(updated.get("breakeven_done"))
 
-    if pending_sell:
-        reason = pending_reason or "retry_sell"
-        return True, reason, price
+    if entry_price <= 0 or sl_price <= 0 or tp_price <= 0:
+        return False, None, None, updated
 
-    if config.rsi_only_sell and is_new_signal:
-        if rsi_now > config.rsi_sell_high or rsi_now < config.rsi_sell_low:
-            return True, "rsi_extreme", price
-        return False, None, None
+    if (not breakeven_done) and risk_r > 0:
+        be_trigger = entry_price + (config.breakeven_after_r * risk_r)
+        if live_high >= be_trigger:
+            updated["sl_price"] = max(sl_price, entry_price)
+            updated["breakeven_done"] = True
+            sl_price = float(updated["sl_price"])
 
-    if live_low <= sl_price:
-        return True, "sl_hit", sl_price
+    sl_hit = live_low <= sl_price
+    tp_hit = live_high >= tp_price
 
-    if live_high >= tp_price:
-        return True, "tp_hit", tp_price
+    if sl_hit and tp_hit:
+        if tie_policy == "TP_FIRST":
+            return True, "tp_hit", tp_price, updated
+        return True, "sl_hit", sl_price, updated
+    if sl_hit:
+        return True, "sl_hit", sl_price, updated
+    if tp_hit:
+        return True, "tp_hit", tp_price, updated
 
-    if is_new_signal:
-        if ema_slow_value < ema_trend_value:
-            return True, "trend_loss", price
-        if config.enable_rsi_sell and (rsi_now > config.rsi_sell_high or rsi_now < config.rsi_sell_low):
-            return True, "rsi_extreme", price
-
-    return False, None, None
+    return False, None, None, updated

@@ -154,6 +154,26 @@ def amount_to_precision(exchange: ccxt.Exchange, symbol: str, amount: float) -> 
         return float(amount)
 
 
+def get_market_min_notional(exchange: ccxt.Exchange, symbol: str) -> float:
+    # Best effort extraction of market min notional. If unavailable, use 0.
+    try:
+        market = exchange.market(symbol)
+    except Exception:
+        return 0.0
+
+    limits = market.get("limits") if isinstance(market, dict) else None
+    if isinstance(limits, dict):
+        cost = limits.get("cost")
+        if isinstance(cost, dict):
+            min_cost = cost.get("min")
+            if min_cost is not None:
+                try:
+                    return float(min_cost)
+                except Exception:
+                    pass
+    return 0.0
+
+
 def place_market_buy(
     exchange: ccxt.Exchange,
     symbol: str,
@@ -225,7 +245,7 @@ def ensure_log_schema(log_file: Path) -> bool:
         return False
 
     backup = log_file.with_name(
-        f"{log_file.stem}_legacy_{pd.Timestamp.utcnow():%Y%m%d_%H%M%S}{log_file.suffix}"
+        f"{log_file.stem}_legacy_{pd.Timestamp.now('UTC'):%Y%m%d_%H%M%S}{log_file.suffix}"
     )
     log_file.rename(backup)
     print(f"WARN log schema mismatch, moved old log to: {backup}")
@@ -247,7 +267,7 @@ def ensure_trades_schema(log_file: Path) -> bool:
         return False
 
     backup = log_file.with_name(
-        f"{log_file.stem}_legacy_{pd.Timestamp.utcnow():%Y%m%d_%H%M%S}{log_file.suffix}"
+        f"{log_file.stem}_legacy_{pd.Timestamp.now('UTC'):%Y%m%d_%H%M%S}{log_file.suffix}"
     )
     log_file.rename(backup)
     print(f"WARN trades log schema mismatch, moved old log to: {backup}")
@@ -353,6 +373,12 @@ def make_exchange(
 
 
 def main() -> None:
+    print(
+        "INFO: bot_readonly.py is deprecated and incompatible with Strategy 2.0.\n"
+        "Run: python src/engine.py"
+    )
+    return
+
     load_env_file(ENV_FILE)
 
     exchange_id = get_env_str("EXCHANGE", "binance").lower()
@@ -383,6 +409,7 @@ def main() -> None:
     )
     rsi_only_sell = get_env_int("RSI_ONLY_SELL", int(DEFAULT_STRATEGY.rsi_only_sell)) == 1
     min_position_eth = get_env_float("MIN_POSITION_ETH", 0.000001)
+    min_position_notional = get_env_float("MIN_POSITION_NOTIONAL_USDC", 5.0)
     tp_pct = get_env_float("TP_PCT", DEFAULT_STRATEGY.tp_pct)
     sl_pct = get_env_float("SL_PCT", DEFAULT_STRATEGY.sl_pct)
     use_full_balance = get_env_int("USE_FULL_BALANCE", 0) == 1
@@ -541,7 +568,15 @@ def main() -> None:
                     position_open = bool(position.get("is_open"))
                     is_new_signal = portfolio.get("last_signal_ts") != signal_ts_iso
                     eth_balance = get_balance(exchange, "ETH")
-                    if (not position_open) and eth_balance > min_position_eth:
+                    market_min_notional = get_market_min_notional(exchange, symbol)
+                    effective_min_notional = max(min_position_notional, market_min_notional)
+                    eth_notional = eth_balance * price
+
+                    if (
+                        (not position_open)
+                        and eth_balance > min_position_eth
+                        and eth_notional >= effective_min_notional
+                    ):
                         position_open = True
                         portfolio["position"] = {
                             "is_open": True,
@@ -561,19 +596,38 @@ def main() -> None:
                         entry_price = float(position.get("entry_price") or 0)
                         entry_ts = position.get("entry_ts")
                         entry_qty = float(position.get("entry_qty") or 0)
+                        entry_notional = entry_qty * price
+
+                        if entry_notional < effective_min_notional:
+                            print(
+                                "WARN: Position below min notional; treating as dust and closing local state."
+                            )
+                            portfolio["position"] = {
+                                "is_open": False,
+                                "entry_price": None,
+                                "entry_ts": None,
+                                "entry_qty": None,
+                                "pending_sell": False,
+                                "pending_reason": None,
+                            }
+                            save_portfolio(portfolio)
+                            position_open = False
+                            entry_qty = 0.0
+
                         live_high = float(live_row["high"])
                         live_low = float(live_row["low"])
-                        sell_signal, sell_reason, sell_price = should_sell_signal(
-                            position=position,
-                            live_high=live_high,
-                            live_low=live_low,
-                            price=price,
-                            ema_slow_value=ema_slow_value,
-                            ema_trend_value=ema_trend_value,
-                            rsi_now=rsi_now,
-                            is_new_signal=is_new_signal,
-                            config=strategy,
-                        )
+                        if position_open:
+                            sell_signal, sell_reason, sell_price = should_sell_signal(
+                                position=position,
+                                live_high=live_high,
+                                live_low=live_low,
+                                price=price,
+                                ema_slow_value=ema_slow_value,
+                                ema_trend_value=ema_trend_value,
+                                rsi_now=rsi_now,
+                                is_new_signal=is_new_signal,
+                                config=strategy,
+                            )
 
                         if sell_reason and entry_price > 0 and entry_qty > 0:
                             available_eth = get_balance(exchange, "ETH")
@@ -614,7 +668,7 @@ def main() -> None:
                                     }
 
                                 log_trade({
-                                    "ts": pd.Timestamp.utcnow().isoformat(),
+                                    "ts": pd.Timestamp.now("UTC").isoformat(),
                                     "action": "SELL",
                                     "symbol": symbol,
                                     "price": avg_price,
@@ -664,7 +718,7 @@ def main() -> None:
                                 }
 
                             log_trade({
-                                "ts": pd.Timestamp.utcnow().isoformat(),
+                                "ts": pd.Timestamp.now("UTC").isoformat(),
                                 "action": "BUY",
                                 "symbol": symbol,
                                 "price": entry_price_used,

@@ -7,7 +7,7 @@ $ErrorActionPreference = 'Stop'
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $VenvPython = Join-Path $ProjectRoot '.venv\Scripts\python.exe'
 $Requirements = Join-Path $ProjectRoot 'requirements.txt'
-$BotPath = Join-Path $ProjectRoot 'src\bot_readonly.py'
+$BotPath = Join-Path $ProjectRoot 'src\engine.py'
 
 if (-not (Test-Path $VenvPython)) {
     Write-Host '[INFO] Tworze virtualenv (.venv)...'
@@ -19,5 +19,5 @@ if ($Install) {
     & $VenvPython -m pip install -r $Requirements
 }
 
-Write-Host '[INFO] Uruchamiam bota (read-only)...'
+Write-Host '[INFO] Uruchamiam bota (engine 2.0)...'
 & $VenvPython $BotPath

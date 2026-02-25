@@ -6,12 +6,18 @@
     "ETH": 0.0
   },
   "position": {
-    "is_open": true,
-    "entry_price": 1859.95,
-    "entry_ts": "2026-02-24T22:00:00",
-    "entry_qty": 0.00010479,
+    "is_open": false,
+    "entry_price": null,
+    "entry_ts": null,
+    "entry_qty": null,
     "pending_sell": false,
     "pending_reason": null
   },
-  "last_signal_ts": "2026-02-24T23:10:00"
+  "regime_state": {
+    "active": "trend_bear",
+    "candidate": "trend_bear",
+    "candidate_count": 0,
+    "hold_count": 791
+  },
+  "last_signal_ts": "2026-02-25T22:00:00+00:00"
 }
